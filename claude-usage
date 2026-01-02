@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+Claude Code Usage - Statusline script
+Receives JSON from Claude Code via stdin when used as statusline command
+Uses pexpect to fetch usage limit data (daily/weekly reset times)
+
+Usage:
+  claude-usage           # Default: model | ctx: Z% (X/Y) | daily: X% (Nh) | weekly: Y% (Nh)
+  claude-usage compact   # Compact: model · D:X% (Nh) · W:Y% (Nh) · C:Z% (X/Y)
+  claude-usage json      # JSON output
+"""
+
+import sys
+import os
+import json
+import re
+import time
+import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pexpect
+
+CACHE_FILE = Path("/tmp/claude_usage_cache.txt")
+CACHE_LOCK = Path("/tmp/claude_usage_cache.lock")
+CACHE_MAX_AGE = 300  # 5 minutes
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+def format_tokens(tokens: int) -> str:
+    """Format token count (e.g., 15234 -> 15k)."""
+    if tokens >= 1000:
+        return f"{tokens // 1000}k"
+    return str(tokens)
+
+def parse_stdin_json() -> dict | None:
+    """Parse JSON from stdin if available."""
+    if sys.stdin.isatty():
+        return None
+    try:
+        return json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+def get_context_from_stdin(data: dict) -> dict:
+    """Extract context window info from stdin JSON."""
+    if not data:
+        return {}
+
+    model = data.get("model", {}).get("id", "")
+    ctx = data.get("context_window", {})
+    context_size = ctx.get("context_window_size", 0)
+    total_input = ctx.get("total_input_tokens", 0)
+    total_output = ctx.get("total_output_tokens", 0)
+
+    tokens_used = total_input + total_output
+    ctx_percent = (tokens_used * 100 // context_size) if context_size > 0 else 0
+
+    return {
+        "model": model,
+        "tokens_used": tokens_used,
+        "context_size": context_size,
+        "ctx_percent": ctx_percent,
+        "tokens_display": format_tokens(tokens_used),
+        "context_display": format_tokens(context_size),
+    }
+
+def cache_is_valid() -> bool:
+    """Check if cache file exists and is fresh."""
+    if not CACHE_FILE.exists():
+        return False
+    age = datetime.now().timestamp() - CACHE_FILE.stat().st_mtime
+    return age < CACHE_MAX_AGE
+
+def cache_exists() -> bool:
+    """Check if cache file exists (may be stale)."""
+    return CACHE_FILE.exists()
+
+def update_in_progress() -> bool:
+    """Check if a background update is already running."""
+    if not CACHE_LOCK.exists():
+        return False
+    # Check if lock is stale (older than 30 seconds = stuck process)
+    age = datetime.now().timestamp() - CACHE_LOCK.stat().st_mtime
+    if age > 30:
+        CACHE_LOCK.unlink(missing_ok=True)
+        return False
+    return True
+
+def start_background_update():
+    """Start a background process to update the cache."""
+    if update_in_progress():
+        debug("background update already in progress")
+        return
+
+    debug("starting background update")
+    # Create lock file
+    CACHE_LOCK.touch()
+
+    # Start background process using this same script with --update flag
+    subprocess.Popen(
+        [sys.executable, __file__, "--update"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+def do_cache_update():
+    """Actually perform the cache update (called by background process)."""
+    try:
+        usage_data = capture_usage()
+        if usage_data:
+            CACHE_FILE.write_text(usage_data)
+            debug("cache updated successfully")
+    finally:
+        CACHE_LOCK.unlink(missing_ok=True)
+
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
+def debug(msg):
+    if DEBUG:
+        print(f"DEBUG: {msg}", file=sys.stderr)
+
+def capture_usage() -> str | None:
+    """Capture usage data using pexpect."""
+    claude_home = os.environ.get("CLAUDE_USAGE_HOME", os.path.expanduser("~/.claude-usage"))
+    os.makedirs(claude_home, exist_ok=True)
+    debug(f"claude_home={claude_home}")
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(claude_home)
+        debug("spawning claude /status")
+
+        child = pexpect.spawn("claude", ["/status"], timeout=20, encoding="utf-8")
+
+        debug("waiting for Settings:")
+        child.expect("Settings:", timeout=10)
+        debug("found Settings:")
+
+        # Tab twice to get to Usage tab (Status -> Config -> Usage)
+        debug("sending tabs")
+        child.send("\t")
+        time.sleep(0.3)
+        child.send("\t")
+        time.sleep(0.5)
+
+        # Wait for usage data to fully load - look for weekly reset date (Jan, Feb, etc.)
+        debug("waiting for weekly reset date pattern")
+        child.expect(r"Current week \(all models\).*?Resets\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}", timeout=10)
+        debug("found weekly reset date")
+
+        # Let more output arrive
+        time.sleep(0.3)
+
+        output = child.before + child.after
+
+        # Read remaining output
+        try:
+            child.expect(pexpect.TIMEOUT, timeout=0.3)
+        except pexpect.TIMEOUT:
+            output += child.before
+
+        debug(f"captured {len(output)} chars")
+
+        child.send("\x1b")
+        child.close()
+        os.chdir(old_cwd)
+        return output
+
+    except (pexpect.exceptions.EOF, pexpect.exceptions.TIMEOUT, Exception) as e:
+        debug(f"Exception: {type(e).__name__}: {e}")
+        try:
+            debug(f"before={child.before[:500] if child.before else 'None'}")
+            child.close()
+        except:
+            pass
+        try:
+            os.chdir(old_cwd)
+        except:
+            pass
+
+    return None
+
+def calc_hours_until_time(reset_line: str) -> str:
+    """Calculate hours until reset time (e.g., 'Resets 8pm' or 'Resets 7:59pm' -> '1h')."""
+    match = re.search(r'Resets\s+(\d{1,2})(?::(\d{2}))?(am|pm)', reset_line, re.IGNORECASE)
+    if not match:
+        return "?"
+
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
+    ampm = match.group(3).lower()
+
+    # Convert to 24h
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # If target is in the past, it's tomorrow
+    if target <= now:
+        target += timedelta(days=1)
+
+    hours_until = int((target - now).total_seconds() / 3600)
+    return f"{hours_until}h"
+
+def calc_days_until_date(reset_line: str) -> str:
+    """Calculate days until reset date (e.g., 'Resets Jan 8, 10am' -> '7d')."""
+    match = re.search(r'Resets\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', reset_line, re.IGNORECASE)
+    if not match:
+        return "?"
+
+    month_str = match.group(1)
+    day = int(match.group(2))
+
+    months = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+    month = months.get(month_str.lower(), 1)
+
+    now = datetime.now()
+    year = now.year
+
+    try:
+        target = datetime(year, month, day)
+        # If target is in the past, it's next year
+        if target.date() < now.date():
+            target = datetime(year + 1, month, day)
+
+        days_until = (target.date() - now.date()).days
+        if days_until == 0:
+            return "<1d"
+        return f"{days_until}d"
+    except ValueError:
+        return "?"
+
+def parse_usage(usage_data: str, ctx_info: dict) -> dict:
+    """Parse usage data and return structured info."""
+    clean = strip_ansi(usage_data)
+    debug(f"cleaned data length: {len(clean)}")
+
+    result = {
+        "model": ctx_info.get("model", ""),
+        "ctx_percent": ctx_info.get("ctx_percent"),
+        "tokens_display": ctx_info.get("tokens_display"),
+        "context_display": ctx_info.get("context_display"),
+        "session_percent": None,
+        "session_reset": "?",
+        "week_percent": None,
+        "week_reset": "?",
+    }
+
+    # Extract session (daily) info - look for "Current session" followed by percentage
+    session_match = re.search(r'Current session.*?(\d+)% used', clean, re.DOTALL)
+    if session_match:
+        result["session_percent"] = int(session_match.group(1))
+
+    # Daily reset is time-based (e.g., "Resets 8pm" or "Resets 7:59pm")
+    session_reset_match = re.search(r'Resets\s+(\d{1,2})(?::\d{2})?(am|pm)', clean, re.IGNORECASE)
+    if session_reset_match:
+        result["session_reset"] = calc_hours_until_time(session_reset_match.group(0))
+
+    # Extract week info
+    week_match = re.search(r'Current week \(all models\).*?(\d+)% used', clean, re.DOTALL)
+    if week_match:
+        result["week_percent"] = int(week_match.group(1))
+
+    # Weekly reset is date-based (e.g., "Resets Jan 8")
+    week_reset_match = re.search(r'Resets\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', clean, re.IGNORECASE)
+    if week_reset_match:
+        result["week_reset"] = calc_days_until_date(week_reset_match.group(0))
+
+    debug(f"parsed: D:{result['session_percent']}% ({result['session_reset']}) W:{result['week_percent']}% ({result['week_reset']})")
+    return result
+
+def format_output(data: dict, fmt: str) -> str:
+    """Format output based on requested format."""
+    model = data.get("model", "")
+    session_pct = data.get("session_percent")
+    session_reset = data.get("session_reset", "?")
+    week_pct = data.get("week_percent")
+    week_reset = data.get("week_reset", "?")
+    ctx_pct = data.get("ctx_percent")
+    tokens_disp = data.get("tokens_display")
+    ctx_disp = data.get("context_display")
+
+    if session_pct is None or week_pct is None:
+        return "N/A"
+
+    if fmt == "compact":
+        parts = [model]
+        parts.append(f"D:{session_pct}% ({session_reset})")
+        parts.append(f"W:{week_pct}% ({week_reset})")
+        if ctx_pct is not None:
+            parts.append(f"C:{ctx_pct}% ({tokens_disp}/{ctx_disp})")
+        return " · ".join(parts)
+
+    elif fmt == "json":
+        output = {
+            "model": model,
+            "session_percent": session_pct,
+            "session_reset": session_reset,
+            "week_percent": week_pct,
+            "week_reset": week_reset,
+        }
+        if ctx_pct is not None:
+            output["context_percent"] = ctx_pct
+            output["tokens_used"] = data.get("tokens_used", 0)
+            output["context_size"] = data.get("context_size", 0)
+        return json.dumps(output, indent=2)
+
+    else:  # default
+        parts = [model]
+        if ctx_pct is not None:
+            parts.append(f"ctx: {ctx_pct}% ({tokens_disp}/{ctx_disp})")
+        parts.append(f"daily: {session_pct}% ({session_reset})")
+        parts.append(f"weekly: {week_pct}% ({week_reset})")
+        return " | ".join(parts)
+
+def main():
+    # Handle background update mode
+    if len(sys.argv) > 1 and sys.argv[1] == "--update":
+        do_cache_update()
+        return
+
+    fmt = sys.argv[1] if len(sys.argv) > 1 else "default"
+
+    # Get context info from stdin JSON
+    stdin_data = parse_stdin_json()
+    ctx_info = get_context_from_stdin(stdin_data)
+
+    # Get usage data with stale-while-revalidate pattern
+    if cache_is_valid():
+        # Cache is fresh, use it
+        debug("using fresh cache")
+        usage_data = CACHE_FILE.read_text()
+    elif cache_exists():
+        # Cache is stale but exists - use stale data and refresh in background
+        debug("using stale cache, starting background refresh")
+        usage_data = CACHE_FILE.read_text()
+        start_background_update()
+    else:
+        # No cache at all - must do blocking fetch first time
+        debug("no cache, doing blocking fetch")
+        usage_data = capture_usage()
+        if usage_data:
+            CACHE_FILE.write_text(usage_data)
+        else:
+            print("N/A")
+            sys.exit(1)
+
+    # Parse and format
+    data = parse_usage(usage_data, ctx_info)
+    print(format_output(data, fmt))
+
+if __name__ == "__main__":
+    main()
