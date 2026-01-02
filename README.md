@@ -14,17 +14,15 @@ claude-opus-4-5-20251101 · D:27% (1h) · W:5% (7d) · C:48% (96k/200k)
 
 ## Requirements
 
-- Python 3.10+
-- `pexpect` library: `pip install pexpect`
+- [uv](https://docs.astral.sh/uv/) (installed automatically by `make dep`)
 
 ## Installation
 
 ```bash
-# Copy to a location in your PATH
-sudo cp claude-usage /usr/local/bin/
-sudo chmod +x /usr/local/bin/claude-usage
+make dep      # Install uv if needed
+make install  # Install to /usr/local/bin
 
-# Configure Claude Code statusline in ~/.claude/settings.json:
+# Then add to ~/.claude/settings.json:
 {
   "statusline": {
     "command": "/usr/local/bin/claude-usage compact"
@@ -45,7 +43,7 @@ claude-usage json      # JSON output
 - Receives context window data from Claude Code via stdin (JSON)
 - Fetches usage limits by running `claude /status` via pexpect
 - Caches usage data for 5 minutes with background refresh
-- First run may be slow; subsequent calls are instant
+- First run may be slow (uv installs dependencies); subsequent calls are instant
 
 ## Environment Variables
 
