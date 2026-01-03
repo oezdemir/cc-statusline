@@ -56,10 +56,19 @@ def get_context_from_stdin(data: dict) -> dict:
     model = data.get("model", {}).get("id", "")
     ctx = data.get("context_window", {})
     context_size = ctx.get("context_window_size", 0)
-    total_input = ctx.get("total_input_tokens", 0)
-    total_output = ctx.get("total_output_tokens", 0)
 
-    tokens_used = total_input + total_output
+    # Use current_usage for accurate context percentage (not cumulative totals)
+    current_usage = ctx.get("current_usage")
+    if current_usage:
+        # Sum input_tokens + cache tokens for current context size
+        tokens_used = (
+            current_usage.get("input_tokens", 0) +
+            current_usage.get("cache_creation_input_tokens", 0) +
+            current_usage.get("cache_read_input_tokens", 0)
+        )
+    else:
+        tokens_used = 0
+
     ctx_percent = (tokens_used * 100 // context_size) if context_size > 0 else 0
 
     return {
