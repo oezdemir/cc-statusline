@@ -30,8 +30,16 @@ CACHE_LOCK = Path("/tmp/claude_usage_cache.lock")
 CACHE_MAX_AGE = 300  # 5 minutes
 
 def strip_ansi(text: str) -> str:
-    """Remove ANSI escape codes from text."""
-    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+    """Remove ANSI escape codes from text, preserving spacing."""
+    # First, replace cursor movement codes with spaces (they act as visual spacing)
+    # \x1b[nC = cursor forward n columns, \x1b[nD = cursor back
+    text = re.sub(r'\x1b\[\d*C', ' ', text)  # Cursor forward -> space
+    text = re.sub(r'\x1b\[\d*D', '', text)   # Cursor back -> remove
+    # Remove all other ANSI escape sequences (colors, cursor up/down, etc.)
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+    # Collapse multiple spaces but preserve newlines
+    text = re.sub(r'[^\S\n]+', ' ', text)
+    return text
 
 def format_tokens(tokens: int) -> str:
     """Format token count (e.g., 15234 -> 15k)."""
@@ -268,25 +276,37 @@ def parse_usage(usage_data: str, ctx_info: dict) -> dict:
         "week_reset": "?",
     }
 
-    # Extract session (daily) info - look for "Current session" followed by percentage
-    session_match = re.search(r'Current session.*?(\d+)% used', clean, re.DOTALL)
-    if session_match:
-        result["session_percent"] = int(session_match.group(1))
+    # Extract session (daily) section - from "Current session" to "Current week"
+    session_section_match = re.search(r'Current session(.*?)Current week', clean, re.DOTALL | re.IGNORECASE)
+    if session_section_match:
+        session_section = session_section_match.group(1)
+        debug(f"session section: {repr(session_section[:200])}")
 
-    # Daily reset is time-based (e.g., "Resets 8pm" or "Resets 7:59pm")
-    session_reset_match = re.search(r'Resets\s+(\d{1,2})(?::\d{2})?(am|pm)', clean, re.IGNORECASE)
-    if session_reset_match:
-        result["session_reset"] = calc_hours_until_time(session_reset_match.group(0))
+        # Get percentage
+        pct_match = re.search(r'(\d+)%\s*used', session_section)
+        if pct_match:
+            result["session_percent"] = int(pct_match.group(1))
 
-    # Extract week info
-    week_match = re.search(r'Current week \(all models\).*?(\d+)% used', clean, re.DOTALL)
-    if week_match:
-        result["week_percent"] = int(week_match.group(1))
+        # Get reset time (e.g., "Resets 2:59pm" or "Resets 8pm")
+        reset_match = re.search(r'Resets\s+(\d{1,2})(?::\d{2})?(am|pm)', session_section, re.IGNORECASE)
+        if reset_match:
+            result["session_reset"] = calc_hours_until_time(reset_match.group(0))
 
-    # Weekly reset is date-based (e.g., "Resets Jan 8")
-    week_reset_match = re.search(r'Resets\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', clean, re.IGNORECASE)
-    if week_reset_match:
-        result["week_reset"] = calc_days_until_date(week_reset_match.group(0))
+    # Extract week section (all models) - from "Current week (all models)" to next section or end
+    week_section_match = re.search(r'Current week \(all models\)(.*?)(?:Current week \(Sonnet|escape|$)', clean, re.DOTALL | re.IGNORECASE)
+    if week_section_match:
+        week_section = week_section_match.group(1)
+        debug(f"week section: {repr(week_section[:200])}")
+
+        # Get percentage
+        pct_match = re.search(r'(\d+)%\s*used', week_section)
+        if pct_match:
+            result["week_percent"] = int(pct_match.group(1))
+
+        # Get reset date (e.g., "Resets Jan 22")
+        reset_match = re.search(r'Resets\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', week_section, re.IGNORECASE)
+        if reset_match:
+            result["week_reset"] = calc_days_until_date(reset_match.group(0))
 
     debug(f"parsed: D:{result['session_percent']}% ({result['session_reset']}) W:{result['week_percent']}% ({result['week_reset']})")
     return result
