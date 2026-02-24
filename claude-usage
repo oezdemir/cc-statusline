@@ -31,9 +31,12 @@ CACHE_MAX_AGE = 300  # 5 minutes
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text, preserving spacing."""
-    # Remove all ANSI escape sequences including cursor movement codes
-    # Don't replace cursor codes with spaces - they often appear within words
+    # Replace cursor-forward codes (\x1b[NC) with a space - they act as word spacing
+    text = re.sub(r'\x1b\[\d*C', ' ', text)
+    # Remove all other ANSI escape sequences
     text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+    # Remove other escape sequences (OSC title sets, etc.)
+    text = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
     # Collapse multiple spaces but preserve newlines
     text = re.sub(r'[^\S\n]+', ' ', text)
     return text
@@ -118,11 +121,15 @@ def start_background_update():
     CACHE_LOCK.touch()
 
     # Start background process using this same script with --update flag
+    # Clean CLAUDECODE from env so nested claude processes can start
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
     subprocess.Popen(
         [sys.executable, __file__, "--update"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True
+        start_new_session=True,
+        env=env,
     )
 
 def do_cache_update():
@@ -152,7 +159,12 @@ def capture_usage() -> str | None:
         os.chdir(claude_home)
         debug("spawning claude /status")
 
-        child = pexpect.spawn("claude", ["/status"], timeout=20, encoding="utf-8")
+        # Unset CLAUDECODE env var so the child claude process doesn't refuse to start
+        # (newer versions detect nested sessions and abort to prevent crashes)
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+
+        child = pexpect.spawn("claude", ["/status"], timeout=20, encoding="utf-8", env=env)
 
         debug("waiting for Settings:")
         child.expect("Settings:", timeout=10)
@@ -165,21 +177,21 @@ def capture_usage() -> str | None:
         child.send("\t")
         time.sleep(0.5)
 
-        # Wait for usage data to fully load - look for weekly reset date (Jan, Feb, etc.)
-        debug("waiting for weekly reset date pattern")
-        child.expect(r"Current week \(all models\).*?Resets\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}", timeout=10)
-        debug("found weekly reset date")
+        # Wait for usage data to load - "Current session" appears when data is ready
+        # (raw output may have ANSI cursor codes between words, so use a simple marker)
+        debug("waiting for usage data")
+        child.expect("Current session", timeout=10)
+        debug("found usage data")
 
-        # Let more output arrive
-        time.sleep(0.3)
+        # Let all usage sections finish rendering
+        time.sleep(1.5)
 
-        output = child.before + child.after
+        # Flush remaining output from buffer
+        # Note: expect(TIMEOUT) returns normally (doesn't raise), so use return value
+        child.expect([pexpect.TIMEOUT], timeout=0.5)
 
-        # Read remaining output
-        try:
-            child.expect(pexpect.TIMEOUT, timeout=0.3)
-        except pexpect.TIMEOUT:
-            output += child.before
+        # Include the matched "Current session" text plus everything after it
+        output = "Current session" + child.before
 
         debug(f"captured {len(output)} chars")
 
@@ -204,8 +216,8 @@ def capture_usage() -> str | None:
 
 def calc_hours_until_time(reset_line: str, assume_am_for_small_hours: bool = False) -> str:
     """Calculate hours until reset time (e.g., 'Resets 8pm' or 'Resets 7:59pm' -> '1h')."""
-    # Handle mangled pexpect output like "Reses5:59pm" or "Reses4m" (missing 't', space, 'p')
-    match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::(\d{2}))?([ap])?m', reset_line, re.IGNORECASE)
+    # Handle mangled pexpect output like "Rese s 2 m" or "Rese s 10:59pm" or "Resets 4pm"
+    match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*(\d{2}))?\s*([ap])?\s*m', reset_line, re.IGNORECASE)
     if not match:
         return "?"
 
@@ -294,14 +306,14 @@ def parse_usage(usage_data: str, ctx_info: dict) -> dict:
             result["session_percent"] = int(pct_match.group(1))
 
         # Get reset time (e.g., "Resets 2:59pm" or "Resets 8pm")
-        # Handle mangled pexpect output like "Reses5:59pm" or "Reses4m" (missing 't', space, 'p')
-        reset_match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::\d{2})?[ap]?m', session_section, re.IGNORECASE)
+        # Handle mangled pexpect output like "Rese s 2 m" or "Rese s 10:59pm" or "Resets 4pm"
+        reset_match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*\d{2})?\s*[ap]?\s*m', session_section, re.IGNORECASE)
         if reset_match:
             # Daily resets are typically early morning, so assume AM for small hours when a/p missing
             result["session_reset"] = calc_hours_until_time(reset_match.group(0), assume_am_for_small_hours=True)
 
     # Extract week section (all models) - from "Current week (all models)" to next section or end
-    week_section_match = re.search(r'Current week \(all models\)(.*?)(?:Current week \(Sonnet|escape|$)', clean, re.DOTALL | re.IGNORECASE)
+    week_section_match = re.search(r'Current week \(all models\)(.*?)(?:Current week \(Sonnet|Extra usage|escape|$)', clean, re.DOTALL | re.IGNORECASE)
     if week_section_match:
         week_section = week_section_match.group(1)
         debug(f"week section: {repr(week_section[:200])}")
@@ -317,7 +329,7 @@ def parse_usage(usage_data: str, ctx_info: dict) -> dict:
             result["week_reset"] = calc_days_until_date(date_match.group(0))
         else:
             # Try time format (reset is today) - handle mangled output like session
-            time_match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::\d{2})?[ap]?m', week_section, re.IGNORECASE)
+            time_match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*\d{2})?\s*[ap]?\s*m', week_section, re.IGNORECASE)
             if time_match:
                 result["week_reset"] = calc_hours_until_time(time_match.group(0))
 

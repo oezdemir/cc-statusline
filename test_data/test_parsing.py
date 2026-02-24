@@ -7,13 +7,19 @@ from datetime import datetime, timedelta
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
+    # Replace cursor-forward codes with a space (they act as word spacing)
+    text = re.sub(r'\x1b\[\d*C', ' ', text)
+    # Remove all other ANSI escape sequences
     text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+    # Remove other escape sequences (OSC title sets, etc.)
+    text = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
+    # Collapse multiple spaces but preserve newlines
     text = re.sub(r'[^\S\n]+', ' ', text)
     return text
 
 def calc_hours_until_time(reset_line: str, assume_am_for_small_hours: bool = False) -> str:
     """Calculate hours until reset time."""
-    match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::(\d{2}))?([ap])?m', reset_line, re.IGNORECASE)
+    match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*(\d{2}))?\s*([ap])?\s*m', reset_line, re.IGNORECASE)
     if not match:
         return "?"
     hour = int(match.group(1))
@@ -74,11 +80,11 @@ def parse_usage(usage_data: str) -> dict:
         pct_match = re.search(r'(\d+)%\s*used', session_section)
         if pct_match:
             result["session_percent"] = int(pct_match.group(1))
-        reset_match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::\d{2})?[ap]?m', session_section, re.IGNORECASE)
+        reset_match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*\d{2})?\s*[ap]?\s*m', session_section, re.IGNORECASE)
         if reset_match:
             result["session_reset"] = calc_hours_until_time(reset_match.group(0), assume_am_for_small_hours=True)
 
-    week_section_match = re.search(r'Current week \(all models\)(.*?)(?:Current week \(Sonnet|escape|$)', clean, re.DOTALL | re.IGNORECASE)
+    week_section_match = re.search(r'Current week \(all models\)(.*?)(?:Current week \(Sonnet|Extra usage|escape|$)', clean, re.DOTALL | re.IGNORECASE)
     if week_section_match:
         week_section = week_section_match.group(1)
         pct_match = re.search(r'(\d+)%\s*used', week_section)
@@ -88,7 +94,7 @@ def parse_usage(usage_data: str) -> dict:
         if date_match:
             result["week_reset"] = calc_days_until_date(date_match.group(0))
         else:
-            time_match = re.search(r'Rese[ts]*\s*(\d{1,2})(?::\d{2})?[ap]?m', week_section, re.IGNORECASE)
+            time_match = re.search(r'Rese[ts ]*(\d{1,2})(?:\s*:\s*\d{2})?\s*[ap]?\s*m', week_section, re.IGNORECASE)
             if time_match:
                 result["week_reset"] = calc_hours_until_time(time_match.group(0))
 
