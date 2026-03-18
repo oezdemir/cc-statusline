@@ -1,4 +1,4 @@
-.PHONY: run install uninstall dep clean help
+.PHONY: run capture install uninstall dep clean help
 
 INSTALL_DIR := /usr/local/bin
 SCRIPT := claude-usage
@@ -6,7 +6,8 @@ SCRIPT := claude-usage
 help:
 	@echo "Usage:"
 	@echo "  make dep       Install uv if not present"
-	@echo "  make run       Run the script"
+	@echo "  make run       Run with captured real stdin data"
+	@echo "  make capture   Set statusline to capture real stdin on next use"
 	@echo "  make install   Install to $(INSTALL_DIR)"
 	@echo "  make uninstall Remove from $(INSTALL_DIR)"
 	@echo "  make clean     Remove cache files"
@@ -19,7 +20,13 @@ dep:
 	@echo "uv is installed: $$(uv --version)"
 
 run: dep
-	@uv run ./$(SCRIPT) compact
+	@uv run ./$(SCRIPT) --replay compact
+
+capture:
+	@echo "Add --capture to your statusline command in ~/.claude/settings.json:"
+	@echo '  { "statusline": { "command": "$(INSTALL_DIR)/$(SCRIPT) --capture compact" } }'
+	@echo ""
+	@echo "After one statusline render, remove --capture and run: make run"
 
 install: dep
 	@chmod +x $(SCRIPT)
@@ -34,5 +41,5 @@ uninstall:
 	@echo "Removed $(INSTALL_DIR)/$(SCRIPT)"
 
 clean:
-	@rm -f /tmp/claude_usage_cache.txt /tmp/claude_usage_cache.lock
+	@rm -f /tmp/claude_usage_cache.json /tmp/claude_usage_cache.lock /tmp/claude_usage_cache.txt
 	@echo "Cache cleared"
