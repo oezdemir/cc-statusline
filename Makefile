@@ -24,7 +24,7 @@ run: dep
 
 capture:
 	@echo "Add --capture to your statusline command in ~/.claude/settings.json:"
-	@echo '  { "statusline": { "command": "$(INSTALL_DIR)/$(SCRIPT) --capture compact" } }'
+	@echo '  { "statusLine": { "type": "command", "command": "$(INSTALL_DIR)/$(SCRIPT) --capture compact" } }'
 	@echo ""
 	@echo "After one statusline render, remove --capture and run: make run"
 
@@ -34,7 +34,7 @@ install: dep
 	@echo "Installed to $(INSTALL_DIR)/$(SCRIPT)"
 	@echo ""
 	@echo "Add to ~/.claude/settings.json:"
-	@echo '  { "statusline": { "command": "$(INSTALL_DIR)/$(SCRIPT) compact" } }'
+	@echo '  { "statusLine": { "type": "command", "command": "$(INSTALL_DIR)/$(SCRIPT) compact" } }'
 
 uninstall:
 	@sudo rm -f $(INSTALL_DIR)/$(SCRIPT)
